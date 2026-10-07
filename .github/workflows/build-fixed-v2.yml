@@ -1,0 +1,133 @@
+name: Build unsigned Location Spoofer
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache-dependency-path: GoSpoofer/go.sum
+
+      - name: Repair known Swift string errors
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYFIX'
+          from pathlib import Path
+          
+          fixes = {
+              'App/MapHomeView.swift': [
+                  (r'DiagLog.add("[cold-start] finish failed:\(errMsg ?? "VPN start failed")',
+                   r'DiagLog.add("[cold-start] finish failed:\(errMsg ?? "VPN start failed")")'),
+                  (r'DiagLog.add("[hot-restart] finish failed:\(errMsg ?? "VPN reconnect failed")',
+                   r'DiagLog.add("[hot-restart] finish failed:\(errMsg ?? "VPN reconnect failed")")'),
+              ],
+              'App/SettingsView.swift': [
+                  ('Text("No logs yet. Run "Set as Location" once and come back.")',
+                   r'Text("No logs yet. Run \"Set as Location\" once and come back.")'),
+              ],
+          }
+          for filename, replacements in fixes.items():
+              path = Path(filename)
+              text = path.read_text()
+              lines = text.splitlines(keepends=True)
+              for old, new in replacements:
+                  bad = [i for i, line in enumerate(lines) if line.strip() == old]
+                  good = [i for i, line in enumerate(lines) if line.strip() == new]
+                  if len(bad) == 1 and not good:
+                      i = bad[0]
+                      lines[i] = lines[i].replace(old, new)
+                      print(f'Fixed known Swift string error in {filename}')
+                  elif not bad and len(good) == 1:
+                      print(f'Already fixed: {filename}')
+                  else:
+                      raise SystemExit(f'Unexpected source in {filename}; refusing to guess a replacement')
+              path.write_text(''.join(lines))
+          PYFIX
+          sdk=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun swiftc -frontend -parse -target arm64-apple-ios18.0 -sdk "$sdk" App/*.swift
+          xcrun swiftc -frontend -parse -target arm64-apple-ios18.0 -sdk "$sdk" Tunnel/*.swift
+
+      - name: Build Go static library
+        run: bash GoSpoofer/make.sh
+
+      - name: Regenerate Xcode project with all Swift sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f project.yml
+          for source in MapHomeView FirstSetupView CoordinateConverter SettingsView SpoofingState DiagLog CertificateInstaller; do
+            test -f "App/$source.swift" || { echo "::error::Missing App/$source.swift in repository"; exit 1; }
+          done
+          brew install xcodegen
+          xcodegen generate --spec project.yml
+          # Check that the regenerated project includes the previously missing types.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('location-spoofer.xcodeproj/project.pbxproj').read_text()
+          for name in ('MapHomeView', 'FirstSetupView', 'CoordinateConverter'):
+              assert f'{name}.swift in Sources' in p, f'{name} was not added to Sources'
+          assert 'path = AppIcon.icon;' not in p, 'Obsolete AppIcon.icon reference remains'
+          assert '-lgolocationspoofer' in p, 'Go linker setting missing'
+          print('Regenerated project includes missing Swift sources.')
+          PY
+
+      - name: Build unsigned app
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project location-spoofer.xcodeproj \
+            -scheme location-spoofer \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/LocationDerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE="" PROVISIONING_PROFILE_SPECIFIER="" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/LocationDerivedData/Build/Products/Release-iphoneos/location-spoofer.app"
+          test -d "$app/PlugIns/location-spoofer-tunnel.appex"
+          mkdir -p "$RUNNER_TEMP/LocationPackage/Payload" "$GITHUB_WORKSPACE/out"
+          cp -R "$app" "$RUNNER_TEMP/LocationPackage/Payload/"
+          cd "$RUNNER_TEMP/LocationPackage"
+          zip -qry "$GITHUB_WORKSPACE/out/LocationSpoofer-unsigned.ipa" Payload
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocationSpoofer-unsigned
+          path: out/LocationSpoofer-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
